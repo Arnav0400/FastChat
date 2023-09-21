@@ -292,8 +292,46 @@ def remove_parent_directory_name(model_path):
     return model_path.split("/")[-1]
 
 
+class PeftModelAdapter:
+    """Loads any "peft" model and it's base model."""
+
+    def match(self, model_path: str):
+        """Accepts any model path with "peft" in the name"""
+        return "peft" in model_path
+
+    def load_model(self, model_path: str, from_pretrained_kwargs: dict):
+        """Loads the base model then the (peft) adapter weights"""
+        from peft import PeftConfig, PeftModel
+
+        config = PeftConfig.from_pretrained(model_path)
+        base_model_path = config.base_model_name_or_path
+        if "peft" in base_model_path:
+            raise ValueError(
+                f"PeftModelAdapter cannot load a base model with 'peft' in the name: {config.base_model_name_or_path}"
+            )
+
+        base_adapter = get_model_adapter(base_model_path)
+        base_model, tokenizer = base_adapter.load_model(
+            base_model_path, from_pretrained_kwargs
+        )
+        model = PeftModel.from_pretrained(base_model, model_path)
+
+        return model, tokenizer
+
+    def get_default_conv_template(self, model_path: str) -> Conversation:
+        """Uses the conv template of the base model"""
+        from peft import PeftConfig, PeftModel
+
+        config = PeftConfig.from_pretrained(model_path)
+        if "peft" in config.base_model_name_or_path:
+            raise ValueError(
+                f"PeftModelAdapter cannot load a base model with 'peft' in the name: {config.base_model_name_or_path}"
+            )
+        return get_conv_template(config.base_model_name_or_path)
+
+
 class VicunaAdapter(BaseModelAdapter):
-    "Model adapater for vicuna-v1.1"
+    "Model adapater for Vicuna models (e.g., lmsys/vicuna-7b-v1.3)" ""
 
     def match(self, model_path: str):
         return "vicuna" in model_path
@@ -326,6 +364,34 @@ class VicunaAdapter(BaseModelAdapter):
                 "2. Use the old conversation template by `python3 -m fastchat.serve.cli --model-path /path/to/vicuna-v0 --conv-template conv_one_shot`\n"
                 "3. Downgrade fschat to fschat==0.1.10 (Not recommonded).\n"
             )
+
+
+class LongChatAdapter(BaseModelAdapter):
+    "Model adapater for LongChat models (e.g., lmsys/longchat-7b-16k)."
+
+    def match(self, model_path: str):
+        return "longchat" in model_path
+
+    def load_model(self, model_path: str, from_pretrained_kwargs: dict):
+        config = AutoConfig.from_pretrained(model_path)
+
+        # Apply monkey patch, TODO(Dacheng): Add flash attention support
+        from fastchat.model.llama_condense_monkey_patch import (
+            replace_llama_with_condense,
+        )
+
+        replace_llama_with_condense(config.rope_condense_ratio)
+
+        tokenizer = AutoTokenizer.from_pretrained(model_path, use_fast=False)
+        model = AutoModelForCausalLM.from_pretrained(
+            model_path,
+            low_cpu_mem_usage=True,
+            **from_pretrained_kwargs,
+        )
+        return model, tokenizer
+
+    def get_default_conv_template(self, model_path: str) -> Conversation:
+        return get_conv_template("vicuna_v1.1")
 
 
 class T5Adapter(BaseModelAdapter):
@@ -366,20 +432,27 @@ class AlpacaAdapter(BaseModelAdapter):
 
 
 class ChatGLMAdapter(BaseModelAdapter):
-    """The model adapter for THUDM/chatglm-6b"""
+    """The model adapter for THUDM/chatglm-6b, THUDM/chatglm2-6b"""
 
     def match(self, model_path: str):
-        return "chatglm" in model_path
+        return "chatglm" in model_path.lower()
 
     def load_model(self, model_path: str, from_pretrained_kwargs: dict):
         revision = from_pretrained_kwargs.get("revision", "main")
+        config = AutoConfig.from_pretrained(model_path, trust_remote_code=True)
         tokenizer = AutoTokenizer.from_pretrained(
-            model_path, trust_remote_code=True, revision=revision
+            model_path, config=config, trust_remote_code=True, revision=revision
         )
         model = AutoModel.from_pretrained(
-            model_path, trust_remote_code=True, **from_pretrained_kwargs
+            model_path, config=config, trust_remote_code=True, **from_pretrained_kwargs
         )
         return model, tokenizer
+
+    def get_default_conv_template(self, model_path: str) -> Conversation:
+        model_path = model_path.lower()
+        if "chatglm2" in model_path:
+            return get_conv_template("chatglm2")
+        return get_conv_template("chatglm")
 
 
 class DollyV2Adapter(BaseModelAdapter):
@@ -453,12 +526,12 @@ class StableLMAdapter(BaseModelAdapter):
 
 
 class MPTAdapter(BaseModelAdapter):
-    """The model adapter for mosaicml/mpt-7b-chat"""
+    """The model adapter for MPT series (mosaicml/mpt-7b-chat, mosaicml/mpt-30b-chat)"""
 
     use_fast_tokenizer = True
 
     def match(self, model_path: str):
-        return "mpt" in model_path and "mpt-30b-chat" not in model_path
+        return "mpt" in model_path
 
     def load_model(self, model_path: str, from_pretrained_kwargs: dict):
         revision = from_pretrained_kwargs.get("revision", "main")
@@ -477,35 +550,14 @@ class MPTAdapter(BaseModelAdapter):
         return model, tokenizer
 
     def get_default_conv_template(self, model_path: str) -> Conversation:
-        return get_conv_template("mpt")
-
-
-class MPTChat30BAdapter(BaseModelAdapter):
-    """The model adapter for mosaicml/mpt-30b-chat"""
-
-    use_fast_tokenizer = True
-
-    def match(self, model_path: str):
-        return "mpt-30b-chat" in model_path
-
-    def load_model(self, model_path: str, from_pretrained_kwargs: dict):
-        revision = from_pretrained_kwargs.get("revision", "main")
-        model = AutoModelForCausalLM.from_pretrained(
-            model_path,
-            low_cpu_mem_usage=True,
-            trust_remote_code=True,
-            max_seq_len=8192,
-            **from_pretrained_kwargs,
-        )
-        tokenizer = AutoTokenizer.from_pretrained(
-            model_path, trust_remote_code=True, use_fast=True, revision=revision
-        )
-        model.config.eos_token_id = tokenizer.eos_token_id
-        model.config.pad_token_id = tokenizer.pad_token_id
-        return model, tokenizer
-
-    def get_default_conv_template(self, model_path: str) -> Conversation:
-        return get_conv_template("mpt-30b-chat")
+        if "mpt-7b-chat" in model_path:
+            return get_conv_template("mpt-7b-chat")
+        elif "mpt-30b-chat" in model_path:
+            return get_conv_template("mpt-30b-chat")
+        elif "mpt-30b-instruct" in model_path:
+            return get_conv_template("mpt-30b-instruct")
+        else:
+            raise ValueError(f"Unknown MPT model: {model_path}")
 
 
 class BaizeAdapter(BaseModelAdapter):
@@ -852,7 +904,9 @@ class BaichuanAdapter(BaseModelAdapter):
 
 # Note: the registration order matters.
 # The one registered earlier has a higher matching priority.
+register_model_adapter(PeftModelAdapter)
 register_model_adapter(VicunaAdapter)
+register_model_adapter(LongChatAdapter)
 register_model_adapter(T5Adapter)
 register_model_adapter(KoalaAdapter)
 register_model_adapter(AlpacaAdapter)
@@ -870,7 +924,6 @@ register_model_adapter(PaLM2Adapter)
 register_model_adapter(ChatGPTAdapter)
 register_model_adapter(ClaudeAdapter)
 register_model_adapter(MPTAdapter)
-register_model_adapter(MPTChat30BAdapter)
 register_model_adapter(BiLLaAdapter)
 register_model_adapter(RedPajamaINCITEAdapter)
 register_model_adapter(H2OGPTAdapter)
